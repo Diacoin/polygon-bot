@@ -11,10 +11,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-          ref: main
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -25,16 +21,8 @@ jobs:
         run: pip install requests urllib3
 
       - name: Run bot
+        env:
+          LAST_BLOCK: ${{ vars.LAST_BLOCK }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
         run: python bot.py
-
-      - name: Save state
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add state.json
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update state"
-            git push --force-with-lease
-          fi

@@ -5,12 +5,14 @@ import urllib3
 from datetime import datetime, timezone
 urllib3.disable_warnings()
 
-API_KEY = os.environ.get("API_KEY", "D9BX98HE38P3RZQVCUU9NAKU1PI8RP53UN")
+API_KEY = "D9BX98HE38P3RZQVCUU9NAKU1PI8RP53UN"
 WALLET = "0x0Cf18469b589973707B605785516EC4f0de35979"
 USDT0_CONTRACT = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "540964914")
-STATE_FILE = "state.json"
+TELEGRAM_TOKEN = "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY"
+TELEGRAM_CHAT_ID = "540964914"
+GH_PAT = os.environ.get("GH_PAT", "")
+REPO = os.environ.get("REPO", "Diacoin/polygon-bot")
+LAST_BLOCK = int(os.environ.get("LAST_BLOCK", "0"))
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -22,21 +24,16 @@ def send_telegram(message):
         print(f"Errore Telegram: {e}")
         return False
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            content = f.read().strip()
-            print(f"State file content: {content}")
-            data = json.loads(content)
-            print(f"Last block loaded: {data.get('last_block', 0)}")
-            return data
-    print("State file not found, starting fresh")
-    return {"last_block": 0}
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-    print(f"State saved: {state}")
+def update_github_variable(value):
+    url = f"https://api.github.com/repos/{REPO}/actions/variables/LAST_BLOCK"
+    headers = {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept": "application/vnd.github+json"
+    }
+    data = {"name": "LAST_BLOCK", "value": str(value)}
+    r = requests.patch(url, headers=headers, json=data, timeout=10)
+    print(f"Update LAST_BLOCK to {value}: {r.status_code}")
+    return r.ok
 
 def get_current_block():
     url = f"https://api.etherscan.io/v2/api?chainid=137&module=proxy&action=eth_blockNumber&apikey={API_KEY}"
@@ -84,20 +81,17 @@ def format_amount(value, decimals):
         return value
 
 if __name__ == "__main__":
-    state = load_state()
-    last_block = state.get("last_block", 0)
-    print(f"Partendo dal blocco: {last_block}")
+    print(f"LAST_BLOCK: {LAST_BLOCK}")
 
-    if last_block == 0:
+    if LAST_BLOCK == 0:
         current_block = get_current_block()
-        state["last_block"] = current_block
-        save_state(state)
+        update_github_variable(current_block)
         print(f"Primo avvio - blocco attuale: {current_block}")
         exit(0)
 
-    transfers = get_latest_transfers(last_block + 1)
-    print(f"Trasferimenti trovati: {len(transfers)}")
-    new_max_block = last_block
+    transfers = get_latest_transfers(LAST_BLOCK + 1)
+    print(f"Trasferimenti trovati dal blocco {LAST_BLOCK+1}: {len(transfers)}")
+    new_max_block = LAST_BLOCK
 
     for tx in transfers:
         block = int(tx.get("blockNumber", 0))
@@ -130,8 +124,7 @@ if __name__ == "__main__":
         if block > new_max_block:
             new_max_block = block
 
-    if new_max_block > last_block:
-        state["last_block"] = new_max_block
-        save_state(state)
+    if new_max_block > LAST_BLOCK:
+        update_github_variable(new_max_block)
 
-    print(f"Controllo completato - ultimo blocco: {state['last_block']}")
+    print(f"Controllo completato - ultimo blocco: {new_max_block}")

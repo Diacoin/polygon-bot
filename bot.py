@@ -10,8 +10,12 @@ urllib3.disable_warnings()
 API_KEY          = os.environ.get("POLYGONSCAN_API_KEY", "D9BX98HE38P3RZQVCUU9NAKU1PI8RP53UN")
 WALLET           = os.environ.get("WALLET", "0x0Cf18469b589973707B605785516EC4f0de35979")
 USDT0_CONTRACT   = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "540964914")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY")
+TELEGRAM_CHAT_IDS = [
+    cid.strip()
+    for cid in os.environ.get("TELEGRAM_CHAT_IDS", "540964914").split(",")
+    if cid.strip()
+]
 POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "60"))   # secondi
 RAILWAY_TOKEN    = os.environ.get("RAILWAY_TOKEN", "")
 STATE_FILE       = "state.json"
@@ -62,12 +66,17 @@ def load_last_block(state: dict) -> int:
 
 def send_telegram(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-        return r.ok
-    except Exception as e:
-        print(f"[telegram] errore: {e}")
-        return False
+    ok = True
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            r = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
+            if not r.ok:
+                print(f"[telegram] errore chat {chat_id}: {r.text}")
+                ok = False
+        except Exception as e:
+            print(f"[telegram] errore chat {chat_id}: {e}")
+            ok = False
+    return ok
 
 
 def get_current_block() -> int:

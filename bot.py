@@ -7,31 +7,44 @@ from datetime import datetime, timezone
 
 urllib3.disable_warnings()
 
-API_KEY      = os.environ.get("POLYGONSCAN_API_KEY", "D9BX98HE38P3RZQVCUU9NAKU1PI8RP53UN")
-WALLET       = os.environ.get("WALLET", "0x0Cf18469b589973707B605785516EC4f0de35979")
-USDT0_CONTRACT = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY")
+API_KEY          = os.environ.get("POLYGONSCAN_API_KEY", "D9BX98HE38P3RZQVCUU9NAKU1PI8RP53UN")
+WALLET           = os.environ.get("WALLET", "0x0Cf18469b589973707B605785516EC4f0de35979")
+USDT0_CONTRACT   = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "540964914")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))  # secondi
-STATE_FILE    = "state.json"
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "60"))   # secondi
+RAILWAY_TOKEN    = os.environ.get("RAILWAY_TOKEN", "")
+STATE_FILE       = "state.json"
+WEEKLY_SECONDS   = 7 * 24 * 3600
 
 
 # ---------------------------------------------------------------------------
 # Stato persistente
 # ---------------------------------------------------------------------------
 
-def load_last_block() -> int:
-    """Carica last_block da file locale, poi da env var, poi usa il blocco attuale."""
+def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
-                data = json.load(f)
-                val = int(data.get("last_block", 0))
-                if val > 0:
-                    print(f"[stato] last_block caricato dal file: {val}")
-                    return val
+                return json.load(f)
         except Exception as e:
             print(f"[stato] errore lettura {STATE_FILE}: {e}")
+    return {}
+
+
+def save_state(data: dict):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[stato] errore scrittura {STATE_FILE}: {e}")
+
+
+def load_last_block(state: dict) -> int:
+    val = int(state.get("last_block", 0))
+    if val > 0:
+        print(f"[stato] last_block caricato dal file: {val}")
+        return val
 
     env_val = int(os.environ.get("LAST_BLOCK", "0"))
     if env_val > 0:
@@ -40,16 +53,7 @@ def load_last_block() -> int:
 
     current = get_current_block()
     print(f"[stato] primo avvio — parto dal blocco attuale: {current}")
-    save_last_block(current)
     return current
-
-
-def save_last_block(block: int):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({"last_block": block}, f)
-    except Exception as e:
-        print(f"[stato] errore scrittura {STATE_FILE}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +119,78 @@ def format_amount(value: str, decimals: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Check settimanale Railway
+# ---------------------------------------------------------------------------
+
+def get_railway_usage() -> dict | None:
+    """Interroga l'API Railway e restituisce i dati di utilizzo del workspace."""
+    if not RAILWAY_TOKEN:
+        return None
+    query = """
+    { me { ... on User { workspaces {
+        name plan
+        customer {
+            currentUsage
+            hasExhaustedFreePlan
+            remainingUsageCreditBalance
+            state
+        }
+    } } } }
+    """
+    try:
+        r = requests.post(
+            "https://backboard.railway.app/graphql/v2",
+            headers={"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"},
+            json={"query": query},
+            timeout=10,
+        )
+        workspaces = r.json()["data"]["me"]["workspaces"]
+        return workspaces[0]["customer"] if workspaces else None
+    except Exception as e:
+        print(f"[railway] errore lettura usage: {e}")
+        return None
+
+
+def send_weekly_railway_report():
+    usage = get_railway_usage()
+    now_str = datetime.now(tz=timezone.utc).strftime("%d/%m/%Y")
+
+    if usage is None:
+        msg = (
+            f"Report settimanale Railway ({now_str})\n\n"
+            f"Impossibile leggere l'utilizzo (token mancante o scaduto).\n"
+            f"Verifica su railway.com che il bot sia ancora attivo."
+        )
+    else:
+        exhausted    = usage.get("hasExhaustedFreePlan", False)
+        state        = usage.get("state", "UNKNOWN")
+        current_usd  = usage.get("currentUsage", 0)
+        remaining    = usage.get("remainingUsageCreditBalance", 0)
+        free_total   = 5.0  # Piano Hobby: $5/mese
+
+        if exhausted or state == "INACTIVE" and current_usd >= free_total:
+            stato_emoji = "SOSPESO"
+            stato_note  = "Credito esaurito — bot sospeso fino al mese successivo."
+        elif remaining <= 1.0:
+            stato_emoji = "ATTENZIONE"
+            stato_note  = f"Credito quasi esaurito! Rimangono solo ${remaining:.2f}."
+        else:
+            stato_emoji = "ATTIVO"
+            stato_note  = "Bot operativo regolarmente."
+
+        msg = (
+            f"Report settimanale Railway ({now_str})\n\n"
+            f"Stato: {stato_emoji}\n"
+            f"Credito usato: ${current_usd:.2f} / ${free_total:.2f}\n"
+            f"Credito rimanente: ${remaining:.2f}\n\n"
+            f"{stato_note}"
+        )
+
+    send_telegram(msg)
+    print(f"[railway] report settimanale inviato")
+
+
+# ---------------------------------------------------------------------------
 # Ciclo principale
 # ---------------------------------------------------------------------------
 
@@ -124,18 +200,18 @@ def check_once(last_block: int) -> int:
 
     new_max_block = last_block
     for tx in transfers:
-        block = int(tx.get("blockNumber", 0))
-        to_addr = tx.get("to", "").lower()
+        block    = int(tx.get("blockNumber", 0))
+        to_addr  = tx.get("to", "").lower()
 
         if to_addr == WALLET.lower():
-            amount   = format_amount(tx.get("value", "0"), tx.get("tokenDecimal", "6"))
+            amount    = format_amount(tx.get("value", "0"), tx.get("tokenDecimal", "6"))
             from_addr = tx.get("from", "")
-            tx_hash  = tx.get("hash", "")
-            token    = tx.get("tokenSymbol", "USDT0")
-            dt_str   = datetime.fromtimestamp(
+            tx_hash   = tx.get("hash", "")
+            token     = tx.get("tokenSymbol", "USDT0")
+            dt_str    = datetime.fromtimestamp(
                 int(tx.get("timeStamp", 0)), tz=timezone.utc
             ).strftime("%d/%m/%Y %H:%M:%S UTC")
-            balance  = get_usdt0_balance()
+            balance   = get_usdt0_balance()
 
             msg = (
                 f"Nuova transazione in entrata!\n\n"
@@ -162,15 +238,24 @@ def main():
     print(f"[avvio] Polling ogni {POLL_INTERVAL}s")
     send_telegram("Bot USDT0 avviato su Railway.")
 
-    last_block = load_last_block()
+    state      = load_state()
+    last_block = load_last_block(state)
+    last_weekly_check = state.get("last_weekly_check", 0)
 
     while True:
         try:
             new_block = check_once(last_block)
             if new_block > last_block:
                 last_block = new_block
-                save_last_block(last_block)
-                print(f"[stato] last_block aggiornato: {last_block}")
+
+            # Check settimanale
+            now_ts = time.time()
+            if now_ts - last_weekly_check >= WEEKLY_SECONDS:
+                send_weekly_railway_report()
+                last_weekly_check = now_ts
+
+            save_state({"last_block": last_block, "last_weekly_check": last_weekly_check})
+
         except Exception as e:
             print(f"[errore] ciclo principale: {e}")
 

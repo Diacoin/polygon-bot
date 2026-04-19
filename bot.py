@@ -1,5 +1,10 @@
+"""
+Bot USDT0 Polygon — esecuzione one-shot per GitHub Actions.
+Lo stato (LAST_BLOCK, LAST_WEEKLY_CHECK) è persistito come variabile
+del repository GitHub tramite API, così sopravvive tra un run e l'altro.
+"""
+
 import requests
-import json
 import os
 import time
 import urllib3
@@ -7,66 +12,78 @@ from datetime import datetime, timezone
 
 urllib3.disable_warnings()
 
-API_KEY          = os.environ.get("POLYGONSCAN_API_KEY", "D9BX98HE38P3RZQVCUU9NAKU1PI8RP53UN")
-WALLET           = os.environ.get("WALLET", "0x0Cf18469b589973707B605785516EC4f0de35979")
+# ---------------------------------------------------------------------------
+# Configurazione — tutte le variabili obbligatorie arrivano dai secrets/vars GHA
+# ---------------------------------------------------------------------------
+
+API_KEY          = os.environ["POLYGONSCAN_API_KEY"]
+WALLET           = os.environ["WALLET"]
 USDT0_CONTRACT   = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "8750629917:AAHfXl9Ovlkg-RJAu8g78B2F49AcSRbiFIY")
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_IDS = [
     cid.strip()
-    for cid in os.environ.get("TELEGRAM_CHAT_IDS", "540964914").split(",")
+    for cid in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
     if cid.strip()
 ]
-POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "60"))   # secondi
 RAILWAY_TOKEN    = os.environ.get("RAILWAY_TOKEN", "")
-STATE_FILE       = "state.json"
+GH_PAT           = os.environ.get("GH_PAT", "")
+REPO             = os.environ.get("REPO", "")   # es. "Diacoin/polygon-bot"
 WEEKLY_SECONDS   = 7 * 24 * 3600
 
 
 # ---------------------------------------------------------------------------
-# Stato persistente
+# GitHub Variables API  (persiste lo stato tra un run e l'altro)
 # ---------------------------------------------------------------------------
 
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[stato] errore lettura {STATE_FILE}: {e}")
-    return {}
+def _gh_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
-def save_state(data: dict):
+def read_gh_var(name: str) -> str:
+    """Legge una variabile del repository GitHub. Restituisce '' se non trovata."""
+    if not GH_PAT or not REPO:
+        return ""
+    url = f"https://api.github.com/repos/{REPO}/actions/variables/{name}"
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(data, f)
+        r = requests.get(url, headers=_gh_headers(), timeout=10)
+        if r.ok:
+            return r.json().get("value", "")
+        print(f"[gh] variabile {name} non trovata ({r.status_code})")
     except Exception as e:
-        print(f"[stato] errore scrittura {STATE_FILE}: {e}")
+        print(f"[gh] errore lettura {name}: {e}")
+    return ""
 
 
-def load_last_block(state: dict) -> int:
-    val = int(state.get("last_block", 0))
-    if val > 0:
-        print(f"[stato] last_block caricato dal file: {val}")
-        return val
-
-    env_val = int(os.environ.get("LAST_BLOCK", "0"))
-    if env_val > 0:
-        print(f"[stato] last_block caricato da env: {env_val}")
-        return env_val
-
-    current = get_current_block()
-    print(f"[stato] primo avvio — parto dal blocco attuale: {current}")
-    return current
+def write_gh_var(name: str, value: str):
+    """Crea o aggiorna una variabile del repository GitHub."""
+    if not GH_PAT or not REPO:
+        print(f"[gh] GH_PAT/REPO mancanti — {name} non aggiornato")
+        return
+    base    = f"https://api.github.com/repos/{REPO}/actions/variables"
+    payload = {"name": name, "value": value}
+    try:
+        r = requests.patch(f"{base}/{name}", headers=_gh_headers(), json=payload, timeout=10)
+        if r.status_code == 404:
+            r = requests.post(base, headers=_gh_headers(), json=payload, timeout=10)
+        if r.ok:
+            print(f"[gh] {name} aggiornato: {value}")
+        else:
+            print(f"[gh] errore scrittura {name}: {r.status_code} — {r.text}")
+    except Exception as e:
+        print(f"[gh] errore scrittura {name}: {e}")
 
 
 # ---------------------------------------------------------------------------
-# API helpers
+# Telegram
 # ---------------------------------------------------------------------------
 
 def send_telegram(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    ok = True
+    ok  = True
     for chat_id in TELEGRAM_CHAT_IDS:
         try:
             r = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
@@ -78,6 +95,10 @@ def send_telegram(message: str) -> bool:
             ok = False
     return ok
 
+
+# ---------------------------------------------------------------------------
+# PolygonScan API
+# ---------------------------------------------------------------------------
 
 def get_current_block() -> int:
     url = (f"https://api.etherscan.io/v2/api?chainid=137"
@@ -128,11 +149,10 @@ def format_amount(value: str, decimals: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Check settimanale Railway
+# Report settimanale Railway
 # ---------------------------------------------------------------------------
 
 def get_railway_usage() -> dict | None:
-    """Interroga l'API Railway e restituisce i dati di utilizzo del workspace."""
     if not RAILWAY_TOKEN:
         return None
     query = """
@@ -161,7 +181,7 @@ def get_railway_usage() -> dict | None:
 
 
 def send_weekly_railway_report():
-    usage = get_railway_usage()
+    usage   = get_railway_usage()
     now_str = datetime.now(tz=timezone.utc).strftime("%d/%m/%Y")
 
     if usage is None:
@@ -171,41 +191,60 @@ def send_weekly_railway_report():
             f"Verifica su railway.com che il bot sia ancora attivo."
         )
     else:
-        exhausted    = usage.get("hasExhaustedFreePlan", False)
-        state        = usage.get("state", "UNKNOWN")
-        current_usd  = usage.get("currentUsage", 0)
-        remaining    = usage.get("remainingUsageCreditBalance", 0)
-        free_total   = 5.0  # Piano Hobby: $5/mese
+        exhausted   = usage.get("hasExhaustedFreePlan", False)
+        state       = usage.get("state", "UNKNOWN")
+        current_usd = usage.get("currentUsage", 0)
+        remaining   = usage.get("remainingUsageCreditBalance", 0)
+        free_total  = 5.0
 
-        if exhausted or state == "INACTIVE" and current_usd >= free_total:
-            stato_emoji = "SOSPESO"
-            stato_note  = "Credito esaurito — bot sospeso fino al mese successivo."
+        if exhausted or (state == "INACTIVE" and current_usd >= free_total):
+            stato = "SOSPESO"
+            note  = "Credito esaurito — bot sospeso fino al mese successivo."
         elif remaining <= 1.0:
-            stato_emoji = "ATTENZIONE"
-            stato_note  = f"Credito quasi esaurito! Rimangono solo ${remaining:.2f}."
+            stato = "ATTENZIONE"
+            note  = f"Credito quasi esaurito! Rimangono solo ${remaining:.2f}."
         else:
-            stato_emoji = "ATTIVO"
-            stato_note  = "Bot operativo regolarmente."
+            stato = "ATTIVO"
+            note  = "Bot operativo regolarmente."
 
         msg = (
             f"Report settimanale Railway ({now_str})\n\n"
-            f"Stato: {stato_emoji}\n"
+            f"Stato: {stato}\n"
             f"Credito usato: ${current_usd:.2f} / ${free_total:.2f}\n"
             f"Credito rimanente: ${remaining:.2f}\n\n"
-            f"{stato_note}"
+            f"{note}"
         )
 
     send_telegram(msg)
-    print(f"[railway] report settimanale inviato")
+    print("[railway] report settimanale inviato")
 
 
 # ---------------------------------------------------------------------------
-# Ciclo principale
+# Main — one-shot
 # ---------------------------------------------------------------------------
 
-def check_once(last_block: int) -> int:
-    transfers = get_latest_transfers(last_block + 1)
-    print(f"[check] dal blocco {last_block + 1}: {len(transfers)} trasferimenti trovati")
+def main():
+    print(f"[avvio] Bot USDT0 Polygon — wallet {WALLET}")
+
+    # ── 1. Leggi LAST_BLOCK ──────────────────────────────────────────────────
+    # Priorità: env passato dal workflow → variabile GitHub → primo avvio
+    last_block = int(os.environ.get("LAST_BLOCK", "0"))
+    if last_block == 0:
+        raw = read_gh_var("LAST_BLOCK")
+        last_block = int(raw) if raw.isdigit() else 0
+
+    if last_block == 0:
+        current = get_current_block()
+        print(f"[stato] primo avvio — salvo blocco attuale: {current}")
+        write_gh_var("LAST_BLOCK", str(current))
+        write_gh_var("LAST_WEEKLY_CHECK", str(int(time.time())))
+        return
+
+    print(f"[stato] scansione dal blocco: {last_block + 1}")
+
+    # ── 2. Controlla nuovi trasferimenti ─────────────────────────────────────
+    transfers    = get_latest_transfers(last_block + 1)
+    print(f"[check] {len(transfers)} trasferimenti trovati")
 
     new_max_block = last_block
     for tx in transfers:
@@ -239,36 +278,20 @@ def check_once(last_block: int) -> int:
         if block > new_max_block:
             new_max_block = block
 
-    return new_max_block
+    # ── 3. Aggiorna LAST_BLOCK ───────────────────────────────────────────────
+    if new_max_block > last_block:
+        write_gh_var("LAST_BLOCK", str(new_max_block))
+    else:
+        print(f"[stato] nessun nuovo blocco — last_block invariato: {last_block}")
 
+    # ── 4. Report settimanale (se sono passati 7 giorni) ────────────────────
+    raw_weekly = read_gh_var("LAST_WEEKLY_CHECK")
+    last_weekly = int(raw_weekly) if raw_weekly.isdigit() else 0
+    now_ts      = int(time.time())
 
-def main():
-    print(f"[avvio] Bot USDT0 Polygon — wallet {WALLET}")
-    print(f"[avvio] Polling ogni {POLL_INTERVAL}s")
-    send_telegram("Bot USDT0 avviato su Railway.")
-
-    state      = load_state()
-    last_block = load_last_block(state)
-    last_weekly_check = state.get("last_weekly_check", 0)
-
-    while True:
-        try:
-            new_block = check_once(last_block)
-            if new_block > last_block:
-                last_block = new_block
-
-            # Check settimanale
-            now_ts = time.time()
-            if now_ts - last_weekly_check >= WEEKLY_SECONDS:
-                send_weekly_railway_report()
-                last_weekly_check = now_ts
-
-            save_state({"last_block": last_block, "last_weekly_check": last_weekly_check})
-
-        except Exception as e:
-            print(f"[errore] ciclo principale: {e}")
-
-        time.sleep(POLL_INTERVAL)
+    if now_ts - last_weekly >= WEEKLY_SECONDS:
+        send_weekly_railway_report()
+        write_gh_var("LAST_WEEKLY_CHECK", str(now_ts))
 
 
 if __name__ == "__main__":

@@ -2,18 +2,20 @@ name: Polygon Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+    - cron: '*/5 * * * *'   # ogni 5 minuti
+  workflow_dispatch:         # esecuzione manuale dalla UI GitHub
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 4       # sicurezza: se il job supera 4 min viene killato
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -22,7 +24,12 @@ jobs:
 
       - name: Run bot
         env:
-          LAST_BLOCK: ${{ vars.LAST_BLOCK }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          REPO: ${{ github.repository }}
+          POLYGONSCAN_API_KEY: ${{ secrets.POLYGONSCAN_API_KEY }}
+          WALLET:              ${{ secrets.WALLET }}
+          TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_IDS:   ${{ secrets.TELEGRAM_CHAT_IDS }}
+          RAILWAY_TOKEN:       ${{ secrets.RAILWAY_TOKEN }}
+          GH_PAT:              ${{ secrets.GH_PAT }}
+          REPO:                ${{ github.repository }}
+          LAST_BLOCK:          ${{ vars.LAST_BLOCK }}
         run: python bot.py

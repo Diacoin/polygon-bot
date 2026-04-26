@@ -33,6 +33,7 @@ RAILWAY_TOKEN    = os.environ.get("RAILWAY_TOKEN", "")
 GH_PAT           = os.environ.get("GH_PAT", "")
 REPO             = os.environ.get("REPO", "")
 WEEKLY_SECONDS   = 7 * 24 * 3600
+MIN_AMOUNT       = 1.0  # ignora transazioni sotto 1 USDT0
 
 # Nodi RPC pubblici Polygon (fallback automatico)
 RPC_NODES = [
@@ -323,6 +324,12 @@ def main():
         from_addr = tx.get("from", "")
         tx_hash   = tx.get("hash", "")
         token     = tx.get("tokenSymbol", "USDT0")
+
+        if float(amount.replace(",", "")) < MIN_AMOUNT:
+            print(f"[skip] dust tx ignorata — {amount} {token} (blocco {block})")
+            if block > new_max_block:
+                new_max_block = block
+            continue
         dt_str    = datetime.fromtimestamp(
             int(tx.get("timeStamp", 0)), tz=timezone.utc
         ).strftime("%d/%m/%Y %H:%M:%S UTC")
@@ -339,11 +346,10 @@ def main():
         )
         if send_telegram(msg):
             print(f"[telegram] notifica inviata — {amount} {token} (blocco {block})")
+            if block > new_max_block:
+                new_max_block = block
         else:
-            print(f"[telegram] errore invio per TX {tx_hash}")
-
-        if block > new_max_block:
-            new_max_block = block
+            print(f"[telegram] errore invio per TX {tx_hash} — LAST_BLOCK non aggiornato, verrà riprovato")
 
     # ── 3. Aggiorna LAST_BLOCK ───────────────────────────────────────────────
     if new_max_block > last_block:

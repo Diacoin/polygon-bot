@@ -311,7 +311,8 @@ def main():
         write_gh_var("LAST_WEEKLY_CHECK", str(int(time.time())))
         return
 
-    print(f"[stato] scansione dal blocco: {last_block + 1}")
+    current_block = get_current_block()
+    print(f"[stato] scansione dal blocco: {last_block + 1} → {current_block}")
 
     # ── 2. Controlla nuovi trasferimenti in entrata ──────────────────────────
     transfers = get_latest_transfers(last_block)
@@ -352,10 +353,13 @@ def main():
             print(f"[telegram] errore invio per TX {tx_hash} — LAST_BLOCK non aggiornato, verrà riprovato")
 
     # ── 3. Aggiorna LAST_BLOCK ───────────────────────────────────────────────
-    if new_max_block > last_block:
-        write_gh_var("LAST_BLOCK", str(new_max_block))
-    else:
-        print(f"[stato] nessun nuovo blocco — last_block invariato: {last_block}")
+    # Avanza sempre fino al blocco attuale: se non ci sono transazioni,
+    # il prossimo run scansionerà solo i blocchi nuovi, non tutto il backlog.
+    final_block = max(new_max_block, current_block)
+    if final_block > last_block:
+        write_gh_var("LAST_BLOCK", str(final_block))
+        if new_max_block == last_block:
+            print(f"[stato] nessuna transazione — last_block avanzato a {final_block}")
 
     # ── 4. Report settimanale ────────────────────────────────────────────────
     raw_weekly  = read_gh_var("LAST_WEEKLY_CHECK")

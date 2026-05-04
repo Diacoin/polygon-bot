@@ -1,12 +1,10 @@
 """
-Bot USDT0 Polygon — esecuzione one-shot per GitHub Actions.
+Bot USDT0 Polygon — servizio continuo su Railway.
 
-Sorgenti dati (nessuna API key richiesta):
-  - Saldo:        ERC-20 balanceOf via JSON-RPC su nodi pubblici Polygon
-  - Transazioni:  BlockScout API (polygon.blockscout.com)
-  - Blocco attuale: eth_blockNumber via JSON-RPC
+Monitora in tempo reale il wallet configurato e invia notifica Telegram
+per ogni trasferimento in entrata >= MIN_AMOUNT USDT0.
 
-Stato (LAST_BLOCK, LAST_WEEKLY_CHECK) persistito su GitHub Variables API.
+Stato (LAST_BLOCK) persistito via Railway Variables API.
 """
 
 import requests
@@ -29,13 +27,10 @@ TELEGRAM_CHAT_IDS = [
     for cid in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
     if cid.strip()
 ]
-RAILWAY_TOKEN    = os.environ.get("RAILWAY_TOKEN", "")
-GH_PAT           = os.environ.get("GH_PAT", "")
-REPO             = os.environ.get("REPO", "")
-WEEKLY_SECONDS   = 7 * 24 * 3600
-MIN_AMOUNT       = 1.0  # ignora transazioni sotto 1 USDT0
+STATE_FILE = "/app/state.json"  # persiste tra restart sullo stesso volume Railway
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "60"))
+MIN_AMOUNT       = 1.0
 
-# Nodi RPC pubblici Polygon (fallback automatico)
 RPC_NODES = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.meowrpc.com",
@@ -47,65 +42,42 @@ BLOCKSCOUT = "https://polygon.blockscout.com/api/v2"
 
 
 # ---------------------------------------------------------------------------
-# GitHub Variables API
+# State file — persiste LAST_BLOCK tra i riavvii (volume Railway)
 # ---------------------------------------------------------------------------
 
-def _gh_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {GH_PAT}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+import json as _json
 
-
-def read_gh_var(name: str) -> str:
-    if not GH_PAT or not REPO:
-        return ""
+def load_state() -> dict:
     try:
-        r = requests.get(
-            f"https://api.github.com/repos/{REPO}/actions/variables/{name}",
-            headers=_gh_headers(), timeout=10
-        )
-        return r.json().get("value", "") if r.ok else ""
-    except Exception as e:
-        print(f"[gh] errore lettura {name}: {e}")
-        return ""
+        with open(STATE_FILE, "r") as f:
+            return _json.load(f)
+    except Exception:
+        return {}
 
-
-def write_gh_var(name: str, value: str):
-    if not GH_PAT or not REPO:
-        print(f"[gh] GH_PAT/REPO mancanti — {name} non aggiornato")
-        return
-    base    = f"https://api.github.com/repos/{REPO}/actions/variables"
-    payload = {"name": name, "value": value}
+def save_state(state: dict):
     try:
-        r = requests.patch(f"{base}/{name}", headers=_gh_headers(), json=payload, timeout=10)
-        if r.status_code == 404:
-            r = requests.post(base, headers=_gh_headers(), json=payload, timeout=10)
-        if r.ok:
-            print(f"[gh] {name} = {value}")
-        else:
-            print(f"[gh] errore scrittura {name}: {r.status_code} — {r.text}")
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            _json.dump(state, f)
+        print(f"[state] salvato: {state}")
     except Exception as e:
-        print(f"[gh] errore scrittura {name}: {e}")
+        print(f"[state] errore scrittura: {e}")
 
 
 # ---------------------------------------------------------------------------
-# JSON-RPC Polygon (con fallback automatico tra i nodi)
+# JSON-RPC Polygon
 # ---------------------------------------------------------------------------
 
 def _rpc(method: str, params: list):
-    """Chiama un metodo JSON-RPC provando i nodi in ordine fino al primo che risponde."""
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     for node in RPC_NODES:
         try:
-            r = requests.post(node, json=payload, timeout=10)
+            r = requests.post(node, json=payload, timeout=10, verify=False)
             data = r.json()
             if "result" in data:
                 return data["result"]
-            print(f"[rpc] {node} errore: {data.get('error', {}).get('message', '?')}")
-        except Exception as e:
-            print(f"[rpc] {node} non raggiungibile: {e}")
+        except Exception:
+            continue
     return None
 
 
@@ -115,25 +87,18 @@ def get_current_block() -> int:
 
 
 def get_usdt0_balance() -> str:
-    """Legge il saldo USDT0 direttamente dal contratto via eth_call (sempre accurato)."""
-    # balanceOf(address) selector = 0x70a08231
     data = "0x70a08231" + "000000000000000000000000" + WALLET[2:].lower()
     res  = _rpc("eth_call", [{"to": USDT0_CONTRACT, "data": data}, "latest"])
     if res and res not in ("0x", "0x0"):
-        balance = int(res, 16) / 1_000_000
-        return f"{balance:,.2f}"
+        return f"{int(res, 16) / 1_000_000:,.2f}"
     return "N/A"
 
 
 # ---------------------------------------------------------------------------
-# BlockScout API — trasferimenti token
+# BlockScout — trasferimenti token in entrata
 # ---------------------------------------------------------------------------
 
 def get_latest_transfers(from_block: int) -> list:
-    """
-    Recupera i trasferimenti in entrata USDT0 con block_number > from_block.
-    BlockScout restituisce i dati dal più recente al meno recente; paginato.
-    """
     results = []
     params  = {
         "token":  USDT0_CONTRACT,
@@ -143,8 +108,10 @@ def get_latest_transfers(from_block: int) -> list:
 
     while True:
         try:
-            r    = requests.get(f"{BLOCKSCOUT}/addresses/{WALLET}/token-transfers",
-                                params=params, timeout=15)
+            r    = requests.get(
+                f"{BLOCKSCOUT}/addresses/{WALLET}/token-transfers",
+                params=params, timeout=15
+            )
             data = r.json()
         except Exception as e:
             print(f"[blockscout] errore fetch: {e}")
@@ -159,36 +126,31 @@ def get_latest_transfers(from_block: int) -> list:
                 stop = True
                 break
 
-            ts_raw = item.get("timestamp", "")
             try:
                 ts_unix = int(
-                    datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+                    datetime.fromisoformat(
+                        item.get("timestamp", "").replace("Z", "+00:00")
+                    ).timestamp()
                 )
             except Exception:
                 ts_unix = 0
 
             total    = item.get("total", {})
-            value    = total.get("value", "0")
-            decimals = total.get("decimals", "6")
-
             results.append({
                 "blockNumber":  str(block_num),
                 "timeStamp":    str(ts_unix),
                 "hash":         item.get("transaction_hash", ""),
                 "from":         item.get("from", {}).get("hash", ""),
-                "to":           item.get("to", {}).get("hash", ""),
-                "value":        value,
-                "tokenDecimal": decimals,
+                "value":        total.get("value", "0"),
+                "tokenDecimal": total.get("decimals", "6"),
                 "tokenSymbol":  item.get("token", {}).get("symbol", "USDT0"),
             })
 
         if stop or not data.get("next_page_params"):
             break
 
-        # Aggiorna i parametri per la pagina successiva
         params = {**params, **data["next_page_params"]}
 
-    # Restituisce in ordine cronologico (blocco crescente)
     results.sort(key=lambda x: int(x["blockNumber"]))
     return results
 
@@ -220,155 +182,81 @@ def send_telegram(message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Report settimanale Railway
-# ---------------------------------------------------------------------------
-
-def get_railway_usage() -> dict | None:
-    if not RAILWAY_TOKEN:
-        return None
-    query = """
-    { me { ... on User { workspaces {
-        name plan
-        customer {
-            currentUsage
-            hasExhaustedFreePlan
-            remainingUsageCreditBalance
-            state
-        }
-    } } } }
-    """
-    try:
-        r = requests.post(
-            "https://backboard.railway.app/graphql/v2",
-            headers={"Authorization": f"Bearer {RAILWAY_TOKEN}",
-                     "Content-Type": "application/json"},
-            json={"query": query},
-            timeout=10,
-        )
-        workspaces = r.json()["data"]["me"]["workspaces"]
-        return workspaces[0]["customer"] if workspaces else None
-    except Exception as e:
-        print(f"[railway] errore lettura usage: {e}")
-        return None
-
-
-def send_weekly_railway_report():
-    usage   = get_railway_usage()
-    now_str = datetime.now(tz=timezone.utc).strftime("%d/%m/%Y")
-
-    if usage is None:
-        msg = (
-            f"Report settimanale Railway ({now_str})\n\n"
-            f"Impossibile leggere l'utilizzo (token mancante o scaduto).\n"
-            f"Verifica su railway.com che il bot sia ancora attivo."
-        )
-    else:
-        exhausted   = usage.get("hasExhaustedFreePlan", False)
-        state       = usage.get("state", "UNKNOWN")
-        current_usd = usage.get("currentUsage", 0)
-        remaining   = usage.get("remainingUsageCreditBalance", 0)
-        free_total  = 5.0
-
-        if exhausted or (state == "INACTIVE" and current_usd >= free_total):
-            stato = "SOSPESO"
-            note  = "Credito esaurito — bot sospeso fino al mese successivo."
-        elif remaining <= 1.0:
-            stato = "ATTENZIONE"
-            note  = f"Credito quasi esaurito! Rimangono solo ${remaining:.2f}."
-        else:
-            stato = "ATTIVO"
-            note  = "Bot operativo regolarmente."
-
-        msg = (
-            f"Report settimanale Railway ({now_str})\n\n"
-            f"Stato: {stato}\n"
-            f"Credito usato: ${current_usd:.2f} / ${free_total:.2f}\n"
-            f"Credito rimanente: ${remaining:.2f}\n\n"
-            f"{note}"
-        )
-
-    send_telegram(msg)
-    print("[railway] report settimanale inviato")
-
-
-# ---------------------------------------------------------------------------
-# Main — one-shot
+# Main — loop continuo
 # ---------------------------------------------------------------------------
 
 def main():
     print(f"[avvio] Bot USDT0 Polygon — wallet {WALLET}")
+    print(f"[avvio] Polling ogni {POLL_INTERVAL}s — soglia minima {MIN_AMOUNT} USDT0")
 
-    # ── 1. Leggi LAST_BLOCK ──────────────────────────────────────────────────
-    last_block = int(os.environ.get("LAST_BLOCK", "0"))
+    # Legge LAST_BLOCK dallo state file (persiste tra i riavvii)
+    state = load_state()
+    last_block = int(state.get("last_block", os.environ.get("LAST_BLOCK", "0")))
+
     if last_block == 0:
-        raw = read_gh_var("LAST_BLOCK")
-        last_block = int(raw) if raw.isdigit() else 0
+        last_block = get_current_block()
+        print(f"[avvio] primo avvio — blocco iniziale: {last_block}")
+        save_state({"last_block": last_block})
 
-    if last_block == 0:
-        current = get_current_block()
-        print(f"[stato] primo avvio — salvo blocco attuale: {current}")
-        write_gh_var("LAST_BLOCK", str(current))
-        write_gh_var("LAST_WEEKLY_CHECK", str(int(time.time())))
-        return
+    print(f"[avvio] in ascolto dal blocco {last_block}")
+    send_telegram(
+        f"Bot USDT0 Polygon avviato\n"
+        f"Wallet: {WALLET[:6]}...{WALLET[-4:]}\n"
+        f"In ascolto dal blocco {last_block}"
+    )
 
-    current_block = get_current_block()
-    print(f"[stato] scansione dal blocco: {last_block + 1} → {current_block}")
+    while True:
+        try:
+            current_block = get_current_block()
+            if current_block <= last_block:
+                time.sleep(POLL_INTERVAL)
+                continue
 
-    # ── 2. Controlla nuovi trasferimenti in entrata ──────────────────────────
-    transfers = get_latest_transfers(last_block)
-    print(f"[check] {len(transfers)} nuovi trasferimenti trovati")
+            print(f"[check] dal blocco {last_block + 1} → {current_block}")
+            transfers = get_latest_transfers(last_block)
 
-    new_max_block = last_block
-    for tx in transfers:
-        block     = int(tx.get("blockNumber", 0))
-        amount    = format_amount(tx.get("value", "0"), tx.get("tokenDecimal", "6"))
-        from_addr = tx.get("from", "")
-        tx_hash   = tx.get("hash", "")
-        token     = tx.get("tokenSymbol", "USDT0")
+            new_max_block = last_block
+            for tx in transfers:
+                block   = int(tx["blockNumber"])
+                amount  = format_amount(tx["value"], tx["tokenDecimal"])
+                token   = tx["tokenSymbol"]
 
-        if float(amount.replace(",", "")) < MIN_AMOUNT:
-            print(f"[skip] dust tx ignorata — {amount} {token} (blocco {block})")
-            if block > new_max_block:
-                new_max_block = block
-            continue
-        dt_str    = datetime.fromtimestamp(
-            int(tx.get("timeStamp", 0)), tz=timezone.utc
-        ).strftime("%d/%m/%Y %H:%M:%S UTC")
-        balance   = get_usdt0_balance()
+                if float(amount.replace(",", "")) < MIN_AMOUNT:
+                    print(f"[skip] dust tx — {amount} {token} (blocco {block})")
+                    new_max_block = max(new_max_block, block)
+                    continue
 
-        msg = (
-            f"Nuova transazione in entrata!\n\n"
-            f"Importo: {amount} {token}\n"
-            f"Saldo attuale: {balance} {token}\n"
-            f"Data: {dt_str}\n"
-            f"Da: {from_addr}\n"
-            f"TX: https://polygonscan.com/tx/{tx_hash}\n"
-            f"Blocco: {block}"
-        )
-        if send_telegram(msg):
-            print(f"[telegram] notifica inviata — {amount} {token} (blocco {block})")
-            if block > new_max_block:
-                new_max_block = block
-        else:
-            print(f"[telegram] errore invio per TX {tx_hash} — LAST_BLOCK non aggiornato, verrà riprovato")
+                dt_str  = datetime.fromtimestamp(
+                    int(tx["timeStamp"]), tz=timezone.utc
+                ).strftime("%d/%m/%Y %H:%M UTC")
+                balance = get_usdt0_balance()
 
-    # ── 3. Aggiorna LAST_BLOCK ───────────────────────────────────────────────
-    # Avanza sempre fino al blocco attuale: se non ci sono transazioni,
-    # il prossimo run scansionerà solo i blocchi nuovi, non tutto il backlog.
-    final_block = max(new_max_block, current_block)
-    if final_block > last_block:
-        write_gh_var("LAST_BLOCK", str(final_block))
-        if new_max_block == last_block:
-            print(f"[stato] nessuna transazione — last_block avanzato a {final_block}")
+                msg = (
+                    f"Nuova transazione in entrata!\n\n"
+                    f"Importo: {amount} {token}\n"
+                    f"Saldo attuale: {balance} {token}\n"
+                    f"Data: {dt_str}\n"
+                    f"Da: {tx['from'][:10]}...{tx['from'][-6:]}\n"
+                    f"TX: https://polygonscan.com/tx/{tx['hash']}\n"
+                    f"Blocco: {block}"
+                )
 
-    # ── 4. Report settimanale ────────────────────────────────────────────────
-    raw_weekly  = read_gh_var("LAST_WEEKLY_CHECK")
-    last_weekly = int(raw_weekly) if raw_weekly.isdigit() else 0
-    now_ts      = int(time.time())
+                if send_telegram(msg):
+                    print(f"[notifica] {amount} {token} — blocco {block}")
+                    new_max_block = max(new_max_block, block)
+                else:
+                    print(f"[errore] notifica fallita per TX {tx['hash']} — riprovo al prossimo ciclo")
 
-    if now_ts - last_weekly >= WEEKLY_SECONDS:
-        send_weekly_railway_report()
-        write_gh_var("LAST_WEEKLY_CHECK", str(now_ts))
+            # Avanza sempre al blocco corrente anche senza transazioni
+            final_block = max(new_max_block, current_block)
+            if final_block > last_block:
+                last_block = final_block
+                save_state({"last_block": last_block})
+
+        except Exception as e:
+            print(f"[errore] ciclo principale: {e}")
+
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":

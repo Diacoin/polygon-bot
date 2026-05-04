@@ -199,11 +199,6 @@ def main():
         save_state({"last_block": last_block})
 
     print(f"[avvio] in ascolto dal blocco {last_block}")
-    send_telegram(
-        f"Bot USDT0 Polygon avviato\n"
-        f"Wallet: {WALLET[:6]}...{WALLET[-4:]}\n"
-        f"In ascolto dal blocco {last_block}"
-    )
 
     while True:
         try:

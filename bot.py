@@ -211,10 +211,20 @@ def main():
             transfers = get_latest_transfers(last_block)
 
             new_max_block = last_block
+            # Set di hash già notificati — caricato dallo state per evitare duplicati
+            notified_hashes: set = set(state.get("notified_hashes", []))
+
             for tx in transfers:
                 block   = int(tx["blockNumber"])
                 amount  = format_amount(tx["value"], tx["tokenDecimal"])
                 token   = tx["tokenSymbol"]
+                tx_hash = tx["hash"]
+
+                # Salta TX già notificate (deduplicazione robusta)
+                if tx_hash in notified_hashes:
+                    print(f"[skip] già notificata — {tx_hash[:12]}... (blocco {block})")
+                    new_max_block = max(new_max_block, block)
+                    continue
 
                 if float(amount.replace(",", "")) < MIN_AMOUNT:
                     print(f"[skip] dust tx — {amount} {token} (blocco {block})")
@@ -232,21 +242,23 @@ def main():
                     f"Saldo attuale: {balance} {token}\n"
                     f"Data: {dt_str}\n"
                     f"Da: {tx['from'][:10]}...{tx['from'][-6:]}\n"
-                    f"TX: https://polygonscan.com/tx/{tx['hash']}\n"
+                    f"TX: https://polygonscan.com/tx/{tx_hash}\n"
                     f"Blocco: {block}"
                 )
 
-                if send_telegram(msg):
-                    print(f"[notifica] {amount} {token} — blocco {block}")
-                    new_max_block = max(new_max_block, block)
-                else:
-                    print(f"[errore] notifica fallita per TX {tx['hash']} — riprovo al prossimo ciclo")
+                send_telegram(msg)
+                print(f"[notifica] {amount} {token} — blocco {block}")
+                notified_hashes.add(tx_hash)
+                new_max_block = max(new_max_block, block)
 
             # Avanza sempre al blocco corrente anche senza transazioni
             final_block = max(new_max_block, current_block)
             if final_block > last_block:
                 last_block = final_block
-                save_state({"last_block": last_block})
+                # Mantieni solo gli ultimi 500 hash per non far crescere lo state
+                hashes_list = list(notified_hashes)[-500:]
+                state = {"last_block": last_block, "notified_hashes": hashes_list}
+                save_state(state)
 
         except Exception as e:
             print(f"[errore] ciclo principale: {e}")

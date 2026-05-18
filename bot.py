@@ -210,8 +210,8 @@ def main():
             print(f"[check] dal blocco {last_block + 1} → {current_block}")
             transfers = get_latest_transfers(last_block)
 
-            new_max_block = last_block
-            # Set di hash già notificati — caricato dallo state per evitare duplicati
+            # Ricarica lo state da disco ad ogni ciclo — garantisce coerenza dopo riavvii
+            state = load_state()
             notified_hashes: set = set(state.get("notified_hashes", []))
 
             for tx in transfers:
@@ -223,12 +223,10 @@ def main():
                 # Salta TX già notificate (deduplicazione robusta)
                 if tx_hash in notified_hashes:
                     print(f"[skip] già notificata — {tx_hash[:12]}... (blocco {block})")
-                    new_max_block = max(new_max_block, block)
                     continue
 
                 if float(amount.replace(",", "")) < MIN_AMOUNT:
                     print(f"[skip] dust tx — {amount} {token} (blocco {block})")
-                    new_max_block = max(new_max_block, block)
                     continue
 
                 dt_str  = datetime.fromtimestamp(
@@ -248,17 +246,19 @@ def main():
 
                 send_telegram(msg)
                 print(f"[notifica] {amount} {token} — blocco {block}")
-                notified_hashes.add(tx_hash)
-                new_max_block = max(new_max_block, block)
 
-            # Avanza sempre al blocco corrente anche senza transazioni
-            final_block = max(new_max_block, current_block)
-            if final_block > last_block:
-                last_block = final_block
-                # Mantieni solo gli ultimi 500 hash per non far crescere lo state
+                # Salva lo state SUBITO dopo la notifica — prima di proseguire
+                notified_hashes.add(tx_hash)
                 hashes_list = list(notified_hashes)[-500:]
-                state = {"last_block": last_block, "notified_hashes": hashes_list}
-                save_state(state)
+                save_state({"last_block": block, "notified_hashes": hashes_list})
+                last_block = block
+
+            # Avanza il blocco fino al blocco corrente anche se non ci sono TX
+            if current_block > last_block:
+                state_now = load_state()
+                hashes_now = state_now.get("notified_hashes", [])
+                save_state({"last_block": current_block, "notified_hashes": hashes_now})
+                last_block = current_block
 
         except Exception as e:
             print(f"[errore] ciclo principale: {e}")

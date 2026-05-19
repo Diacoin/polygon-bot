@@ -214,7 +214,6 @@ def main():
     if last_block == 0:
         last_block = get_current_block()
         print(f"[avvio] primo avvio — blocco iniziale: {last_block}")
-        railway_set_var("LAST_BLOCK", str(last_block))
 
     print(f"[avvio] in ascolto dal blocco {last_block}")
 
@@ -265,15 +264,16 @@ def main():
                 send_telegram(msg)
                 print(f"[notifica] {amount} {token} — blocco {block}")
 
-                # Registra subito l'hash e avanza last_block via Railway API
+                # Registra hash e aggiorna LAST_BLOCK su Railway (solo su TX notificata)
+                # NOTA: aggiornare variabili Railway triggera un nuovo deploy —
+                # lo facciamo SOLO qui (evento raro), mai nel ciclo senza TX.
                 notified_hashes.add(tx_hash)
                 last_block = block
                 railway_set_var("LAST_BLOCK", str(last_block))
 
-            # Avanza sempre al blocco corrente anche senza TX
+            # Avanza last_block in memoria — nessuna chiamata Railway API
             if current_block > last_block:
                 last_block = current_block
-                railway_set_var("LAST_BLOCK", str(last_block))
 
         except Exception as e:
             print(f"[errore] ciclo principale: {e}")

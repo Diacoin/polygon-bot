@@ -1,15 +1,17 @@
 """
 Bot USDT0 Polygon — servizio continuo su Railway.
 
-Monitora in tempo reale il wallet configurato e invia notifica Telegram
+Monitora il wallet configurato e invia notifica Telegram
 per ogni trasferimento in entrata >= MIN_AMOUNT USDT0.
 
-Stato (LAST_BLOCK) persistito via Railway Variables API.
+Stato (LAST_BLOCK + hash notificati) persistito via Railway Variables API
+in modo atomico — elimina race condition da file system condiviso.
 """
 
 import requests
 import os
 import time
+import json
 import urllib3
 from datetime import datetime, timezone
 
@@ -27,9 +29,14 @@ TELEGRAM_CHAT_IDS = [
     for cid in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
     if cid.strip()
 ]
-STATE_FILE = "/app/state.json"  # persiste tra restart sullo stesso volume Railway
 POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "60"))
 MIN_AMOUNT       = 1.0
+
+# Railway API — per persistere last_block in modo atomico
+RAILWAY_TOKEN    = os.environ.get("RAILWAY_TOKEN", "")
+RAILWAY_PROJECT  = os.environ.get("RAILWAY_PROJECT_ID", "")
+RAILWAY_ENV      = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+RAILWAY_SERVICE  = os.environ.get("RAILWAY_SERVICE_ID", "")
 
 RPC_NODES = [
     "https://polygon-bor-rpc.publicnode.com",
@@ -42,26 +49,39 @@ BLOCKSCOUT = "https://polygon.blockscout.com/api/v2"
 
 
 # ---------------------------------------------------------------------------
-# State file — persiste LAST_BLOCK tra i riavvii (volume Railway)
+# Railway Variables API — persistenza atomica di last_block
 # ---------------------------------------------------------------------------
 
-import json as _json
-
-def load_state() -> dict:
+def railway_set_var(name: str, value: str) -> bool:
+    """Aggiorna una variabile Railway. Atomico lato server — nessuna race condition."""
+    if not all([RAILWAY_TOKEN, RAILWAY_PROJECT, RAILWAY_ENV, RAILWAY_SERVICE]):
+        return False
+    mutation = {
+        "query": f'''mutation {{
+            variableUpsert(input: {{
+                projectId: "{RAILWAY_PROJECT}",
+                environmentId: "{RAILWAY_ENV}",
+                serviceId: "{RAILWAY_SERVICE}",
+                name: "{name}",
+                value: "{value}"
+            }})
+        }}'''
+    }
     try:
-        with open(STATE_FILE, "r") as f:
-            return _json.load(f)
-    except Exception:
-        return {}
-
-def save_state(state: dict):
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            _json.dump(state, f)
-        print(f"[state] salvato: {state}")
+        r = requests.post(
+            "https://backboard.railway.app/graphql/v2",
+            json=mutation,
+            headers={
+                "Authorization": f"Bearer {RAILWAY_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        result = r.json()
+        return result.get("data", {}).get("variableUpsert") is True
     except Exception as e:
-        print(f"[state] errore scrittura: {e}")
+        print(f"[railway] errore variableUpsert {name}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +128,7 @@ def get_latest_transfers(from_block: int) -> list:
 
     while True:
         try:
-            r    = requests.get(
+            r = requests.get(
                 f"{BLOCKSCOUT}/addresses/{WALLET}/token-transfers",
                 params=params, timeout=15
             )
@@ -135,7 +155,7 @@ def get_latest_transfers(from_block: int) -> list:
             except Exception:
                 ts_unix = 0
 
-            total    = item.get("total", {})
+            total = item.get("total", {})
             results.append({
                 "blockNumber":  str(block_num),
                 "timeStamp":    str(ts_unix),
@@ -182,23 +202,25 @@ def send_telegram(message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main — loop continuo
+# Main — loop singolo, un'istanza sola
 # ---------------------------------------------------------------------------
 
 def main():
     print(f"[avvio] Bot USDT0 Polygon — wallet {WALLET}")
     print(f"[avvio] Polling ogni {POLL_INTERVAL}s — soglia minima {MIN_AMOUNT} USDT0")
 
-    # Legge LAST_BLOCK dallo state file (persiste tra i riavvii)
-    state = load_state()
-    last_block = int(state.get("last_block", os.environ.get("LAST_BLOCK", "0")))
+    last_block = int(os.environ.get("LAST_BLOCK", "0"))
 
     if last_block == 0:
         last_block = get_current_block()
         print(f"[avvio] primo avvio — blocco iniziale: {last_block}")
-        save_state({"last_block": last_block})
+        railway_set_var("LAST_BLOCK", str(last_block))
 
     print(f"[avvio] in ascolto dal blocco {last_block}")
+
+    # Hash notificati in memoria — non serve persistenza:
+    # se il bot si riavvia, last_block è già avanzato oltre la TX notificata.
+    notified_hashes: set = set()
 
     while True:
         try:
@@ -210,23 +232,19 @@ def main():
             print(f"[check] dal blocco {last_block + 1} → {current_block}")
             transfers = get_latest_transfers(last_block)
 
-            # Ricarica lo state da disco ad ogni ciclo — garantisce coerenza dopo riavvii
-            state = load_state()
-            notified_hashes: set = set(state.get("notified_hashes", []))
-
             for tx in transfers:
                 block   = int(tx["blockNumber"])
+                tx_hash = tx["hash"]
                 amount  = format_amount(tx["value"], tx["tokenDecimal"])
                 token   = tx["tokenSymbol"]
-                tx_hash = tx["hash"]
 
-                # Salta TX già notificate (deduplicazione robusta)
+                # Deduplicazione in memoria (protegge nel ciclo corrente)
                 if tx_hash in notified_hashes:
-                    print(f"[skip] già notificata — {tx_hash[:12]}... (blocco {block})")
+                    print(f"[skip] già notificata — {tx_hash[:12]}...")
                     continue
 
                 if float(amount.replace(",", "")) < MIN_AMOUNT:
-                    print(f"[skip] dust tx — {amount} {token} (blocco {block})")
+                    print(f"[skip] dust tx — {amount} {token}")
                     continue
 
                 dt_str  = datetime.fromtimestamp(
@@ -247,18 +265,15 @@ def main():
                 send_telegram(msg)
                 print(f"[notifica] {amount} {token} — blocco {block}")
 
-                # Salva lo state SUBITO dopo la notifica — prima di proseguire
+                # Registra subito l'hash e avanza last_block via Railway API
                 notified_hashes.add(tx_hash)
-                hashes_list = list(notified_hashes)[-500:]
-                save_state({"last_block": block, "notified_hashes": hashes_list})
                 last_block = block
+                railway_set_var("LAST_BLOCK", str(last_block))
 
-            # Avanza il blocco fino al blocco corrente anche se non ci sono TX
+            # Avanza sempre al blocco corrente anche senza TX
             if current_block > last_block:
-                state_now = load_state()
-                hashes_now = state_now.get("notified_hashes", [])
-                save_state({"last_block": current_block, "notified_hashes": hashes_now})
                 last_block = current_block
+                railway_set_var("LAST_BLOCK", str(last_block))
 
         except Exception as e:
             print(f"[errore] ciclo principale: {e}")

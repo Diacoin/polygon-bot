@@ -2,5 +2,5 @@
 builder = "dockerfile"
 
 [deploy]
-numReplicas = 1
+numReplicas = 0
 restartPolicyType = "never"

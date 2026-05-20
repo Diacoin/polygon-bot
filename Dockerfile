@@ -1,14 +1,16 @@
 FROM python:3.11-slim
 
-# Forza output non bufferizzato — i log appaiono subito in Railway
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONFAULTHANDLER=1
 
-# Il codice sta in /src
 WORKDIR /src
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+
+# Verifica che il file esista e che python funzioni prima di avviare
+RUN python -c "import requests, urllib3; print('imports OK')"
 
 CMD ["python", "-u", "bot.py"]
